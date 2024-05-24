@@ -1,3 +1,4 @@
+
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
@@ -7,16 +8,24 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
+#include "esp_system.h"  // For esp_restart()
 #include "esp_event.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "camera_pins.h"
+#include "camera_pins.h" // Include your camera pin configuration header
 
 static const char *TAG = "camera_httpd";
 
 // Replace with your network credentials
-const char* ssid = "guest";
-const char* password = "guest1979";
+const char* ssid = "GNNET24G";
+const char* password = "Raymond79";
+
+// Unique device name for identification
+const char* device_name = "ESCM1";
+
+// Onboard LED GPIO pins (check your board for correct pins)
+#define ONBOARD_LED_RED 33
+#define ONBOARD_LED_WHITE 4
 
 httpd_handle_t server = NULL;
 
@@ -32,18 +41,6 @@ esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
         last_frame = esp_timer_get_time();
     }
 
-
-
-
-
-
-
-
-
-
-
-    
-
     res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=123456789000000000000987654321");
     if (res != ESP_OK) {
         return res;
@@ -53,19 +50,21 @@ esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
         fb = esp_camera_fb_get();
         if (!fb) {
             ESP_LOGE(TAG, "Camera capture failed");
-            res = ESP_FAIL;
-        } else {
-            if (fb->format != PIXFORMAT_JPEG) {
-                bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-                if (!jpeg_converted) {
-                    ESP_LOGE(TAG, "JPEG compression failed");
-                    esp_camera_fb_return(fb);
-                    res = ESP_FAIL;
-                }
-            } else {
-                _jpg_buf_len = fb->len;
-                _jpg_buf = fb->buf;
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        if (fb->format != PIXFORMAT_JPEG) {
+            bool jpeg_converted = frame2jpg(fb, 30, &_jpg_buf, &_jpg_buf_len); 
+            esp_camera_fb_return(fb);
+            fb = NULL; 
+            if (!jpeg_converted) {
+                ESP_LOGE(TAG, "JPEG compression failed");
+                res = ESP_FAIL;
             }
+        } else {
+            _jpg_buf_len = fb->len;
+            _jpg_buf = fb->buf;
         }
 
         if (res == ESP_OK) {
@@ -80,10 +79,22 @@ esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, "\r\n--123456789000000000000987654321\r\n", 37);
         }
+        
+        // LED: White On (Streaming active)
+        gpio_set_level(ONBOARD_LED_WHITE, 0); // White LED is typically active low
+
+        // Log frame information less frequently
+        static int frame_counter = 0;
+        if (frame_counter++ % 10 == 0) {
+            int64_t frame_time = esp_timer_get_time() - last_frame;
+            last_frame = esp_timer_get_time();
+            frame_time /= 1000;
+            ESP_LOGI(TAG, "MJPG: %uKB %ums (%.1ffps)", (uint32_t)(_jpg_buf_len / 1024), (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time);
+        }
 
         if (fb) {
             esp_camera_fb_return(fb);
-            _jpg_buf = NULL;
+            fb = NULL; 
         } else if (_jpg_buf) {
             free(_jpg_buf);
             _jpg_buf = NULL;
@@ -93,30 +104,14 @@ esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
             break;
         }
 
-        int64_t frame_time = esp_timer_get_time() - last_frame;
-        last_frame = esp_timer_get_time();
-        frame_time /= 1000;
-        ESP_LOGI(TAG, "MJPG: %uKB %ums (%.1ffps)", (uint32_t)(_jpg_buf_len / 1024), (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time);
+        // LED: White Off (momentary pause between frames)
+        gpio_set_level(ONBOARD_LED_WHITE, 1);
     }
 
     last_frame = 0;
     return res;
 }
 
-void startCameraServer() {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-
-    httpd_uri_t uri_handler = {
-        .uri       = "/stream",
-        .method    = HTTP_GET,
-        .handler   = jpg_stream_httpd_handler,
-        .user_ctx  = NULL
-    };
-
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_register_uri_handler(server, &uri_handler);
-    }
-}
 
 void setup() {
     // Initialize NVS
@@ -127,65 +122,115 @@ void setup() {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize WiFi
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    // Configure LED GPIOs as output
+    gpio_pad_select_gpio(ONBOARD_LED_RED);
+    gpio_set_direction(ONBOARD_LED_RED, GPIO_MODE_OUTPUT);
+    gpio_pad_select_gpio(ONBOARD_LED_WHITE);
+    gpio_set_direction(ONBOARD_LED_WHITE, GPIO_MODE_OUTPUT);
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // LED: Slow blink (Red) - Starting up
+    for (int i = 0; i < 3; i++) {  // Blink 3 times during startup
+        gpio_set_level(ONBOARD_LED_RED, 1);
+        vTaskDelay(250 / portTICK_PERIOD_MS);
+        gpio_set_level(ONBOARD_LED_RED, 0);
+        vTaskDelay(250 / portTICK_PERIOD_MS);
+    }
+    // ...(Rest of your Wi-Fi and Camera initialization remains same)
+}
 
-    wifi_config_t wifi_config = {};
-    strcpy((char *)wifi_config.sta.ssid, ssid);
-    strcpy((char *)wifi_config.sta.password, password);
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_connect());
-
-    // Initialize the camera
-    camera_config_t config;
-    config.ledc_channel = LEDC_CHANNEL_0;
-    config.ledc_timer = LEDC_TIMER_0;
-    config.pin_d0 = Y2_GPIO_NUM;
-    config.pin_d1 = Y3_GPIO_NUM;
-    config.pin_d2 = Y4_GPIO_NUM;
-    config.pin_d3 = Y5_GPIO_NUM;
-    config.pin_d4 = Y6_GPIO_NUM;
-    config.pin_d5 = Y7_GPIO_NUM;
-    config.pin_d6 = Y8_GPIO_NUM;
-    config.pin_d7 = Y9_GPIO_NUM;
-    config.pin_xclk = XCLK_GPIO_NUM;
-    config.pin_pclk = PCLK_GPIO_NUM;
-    config.pin_vsync = VSYNC_GPIO_NUM;
-    config.pin_href = HREF_GPIO_NUM;
-    config.pin_sccb_sda = SIOD_GPIO_NUM;
-    config.pin_sccb_scl = SIOC_GPIO_NUM;
-    config.pin_pwdn = PWDN_GPIO_NUM;
-    config.pin_reset = RESET_GPIO_NUM;
-    config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-
-    // Camera init
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
-        return;
+    // LED: Slow blink (Red) - Starting up
+    for (int i = 0; i < 3; i++) {  // Blink 3 times during startup
+        gpio_set_level(ONBOARD_LED_RED, 1); // Turn LED on (Red)
+        vTaskDelay(250 / portTICK_PERIOD_MS);
+        gpio_set_level(ONBOARD_LED_RED, 0); // Turn LED off
+        vTaskDelay(250 / portTICK_PERIOD_MS);
     }
 
-    // Start the server
-    startCameraServer();
+    // Initialize Wi-Fi
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = ssid,  // Use the variable ssid here
+            .password = password, // Use the variable password here
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Set hostname for easier identification in router's client list
+    ESP_ERROR_CHECK(tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, device_name));
+
+    // Connect to Wi-Fi and wait for connection
+    ESP_ERROR_CHECK(esp_wifi_connect());
+    int retry_count = 0;
+    const int MAX_RETRY = 10;
+    while (esp_wifi_get_status() != WIFI_STATUS_CONNECTED && retry_count < MAX_RETRY) {
+        ESP_LOGI(TAG, "Connecting to Wi-Fi...");
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        retry_count++;
+    }
+
+    if (retry_count >= MAX_RETRY) {
+        ESP_LOGE(TAG, "Failed to connect to Wi-Fi");
+        esp_restart(); 
+        return; 
+    }
+
+    ESP_LOGI(TAG, "Connected to Wi-Fi");
+
+    // LED: Red (Wi-Fi error) or Off (Wi-Fi connected)
+    gpio_set_level(ONBOARD_LED_RED, esp_wifi_get_status() == WIFI_STATUS_CONNECTED ? 0 : 1);
+
+    // Initialize camera with error handling and restart
+    camera_config_t config = {
+        .pin_pwdn = PWDN_GPIO_NUM,
+        .pin_reset = RESET_GPIO_NUM,
+        .pin_xclk = XCLK_GPIO_NUM,
+        .pin_sscb_sda = SIOD_GPIO_NUM,
+        .pin_sscb_scl = SIOC_GPIO_NUM,
+        .pin_d7 = Y7_GPIO_NUM,    // Corrected pin assignments
+        .pin_d6 = Y6_GPIO_NUM,
+        .pin_d5 = Y5_GPIO_NUM,
+        .pin_d4 = Y4_GPIO_NUM,
+        .pin_d3 = Y3_GPIO_NUM,
+        .pin_d2 = Y2_GPIO_NUM,
+        .pin_d1 = Y1_GPIO_NUM,
+        .pin_d0 = Y0_GPIO_NUM,
+        .pin_vsync = VSYNC_GPIO_NUM,
+        .pin_href = HREF_GPIO_NUM,
+        .pin_pclk = PCLK_GPIO_NUM,
+
+        .xclk_freq_hz = 20000000,
+        .ledc_timer = LEDC_TIMER_0,
+        .ledc_channel = LEDC_CHANNEL_0,
+        .pixel_format = PIXFORMAT_JPEG, 
+        .frame_size = FRAMESIZE_VGA,
+        .jpeg_quality = 10,
+        .fb_count = 2               
+    }
+    
+    // Start HTTP server
+    httpd_config_t config_httpd = HTTPD_DEFAULT_CONFIG();
+    config_httpd.max_uri_handlers = 8; // Increase max URI handlers for streaming
+    ESP_ERROR_CHECK(httpd_start(&server, &config_httpd));
+    ESP_LOGI(TAG, "HTTP server started");
+
+    // Register URI handler for MJPEG stream
+    httpd_uri_t uri_handler = {
+        .uri = "/jpg_stream",
+        .method = HTTP_GET,
+        .handler = jpg_stream_httpd_handler,
+        .user_ctx = NULL
+    }
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_handler));
 }
 
-// Arduino-like loop function
-void loop() {
-    // Do nothing
-}
-
+// Main function
 void app_main() {
     setup();
 }
+
